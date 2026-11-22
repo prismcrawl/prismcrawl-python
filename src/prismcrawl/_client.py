@@ -6,6 +6,8 @@ from typing import Mapping, Optional
 
 import httpx
 
+from ._account import AccountResource, AsyncAccountResource
+from ._async import AsyncAsyncJobsResource, AsyncJobsResource
 from ._base import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT, AsyncBaseClient, BaseClient
 from ._resources import AsyncResources, Resources
 
@@ -51,6 +53,10 @@ class PrismCrawl(BaseClient, Resources):
             http_client=http_client,
         )
         self._init_resources(self)
+        self.account = AccountResource(self)
+        """Request history across every endpoint."""
+        self.async_jobs = AsyncJobsResource(self)
+        """Status and results for jobs started with ``.submit()``."""
 
     def __enter__(self) -> PrismCrawl:
         return self
@@ -87,6 +93,10 @@ class AsyncPrismCrawl(AsyncBaseClient, AsyncResources):
             http_client=http_client,
         )
         self._init_resources(self)
+        self.account = AsyncAccountResource(self)
+        """Request history across every endpoint."""
+        self.async_jobs = AsyncAsyncJobsResource(self)
+        """Status and results for jobs started with ``.submit()``."""
 
     async def __aenter__(self) -> AsyncPrismCrawl:
         return self

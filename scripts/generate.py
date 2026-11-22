@@ -130,7 +130,8 @@ class TypeEmitter:
         if "enum" in schema:
             values = [v for v in schema["enum"] if v is not None]
             nullable = len(values) != len(schema["enum"])
-            if len(values) > MAX_LITERAL_ENUM or not values:
+            # typing.Literal can't hold floats, e.g. Google Maps min_rating 2.5.
+            if len(values) > MAX_LITERAL_ENUM or not values or any(isinstance(v, float) for v in values):
                 base = self.primitive(schema.get("type"), schema, context, prefix, quote)
             else:
                 base = f"Literal[{', '.join(literal(v) for v in values)}]"
@@ -170,7 +171,7 @@ class TypeEmitter:
         required = set(schema.get("required", []))
         fields = []
         for prop, sub in schema["properties"].items():
-            if not prop.isidentifier() or keyword.iskeyword(prop):
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", prop):
                 raise SystemExit(f"{name}.{prop} is not a valid identifier; extend the generator")
             typ = self.expr(sub, name + pascal(prop))
             desc = sub.get("description", "") if isinstance(sub, dict) else ""
@@ -228,6 +229,10 @@ def attr_name(segment: str) -> str:
     return segment.replace("-", "_")
 
 
+# Only accepted by submit(), where they're required.
+WEBHOOK_PARAMS = ("webhook_url", "webhook_secret")
+
+
 def collect_endpoints(spec: Dict[str, Any], emitter: TypeEmitter) -> List[Endpoint]:
     paths = spec["paths"]
     endpoints = []
@@ -264,7 +269,11 @@ def collect_endpoints(spec: Dict[str, Any], emitter: TypeEmitter) -> List[Endpoi
             pagination = "page"
         else:
             pagination = None
-        params = [Param(name, sub, name in required, sub.get("description", "")) for name, sub in props.items()]
+        params = [
+            Param(name, sub, name in required, sub.get("description", ""))
+            for name, sub in props.items()
+            if name not in WEBHOOK_PARAMS
+        ]
         params.sort(key=lambda p: not p.required)
         endpoints.append(
             Endpoint(
@@ -295,6 +304,15 @@ def render_types(emitter: TypeEmitter) -> str:
     names = sorted([t.name for t in emitter.typed_dicts] + [a[0] for a in emitter.aliases])
     out.append("__all__ = [\n" + "".join(f'    "{n}",\n' for n in names) + "]\n")
     for td in emitter.typed_dicts:
+        if any(not name.isidentifier() or keyword.iskeyword(name) for name, *_ in td.fields):
+            # Field names like `from` need the functional syntax.
+            out.append(f"\n\n{td.name} = TypedDict(\n    {json.dumps(td.name)},\n    {{\n")
+            for name, typ, required, _desc in td.fields:
+                out.append(f"        {json.dumps(name)}: {'Required[' + typ + ']' if required else typ},\n")
+            out.append("    },\n    total=False,\n)\n")
+            if td.description:
+                out.append(docstring(td.description, ""))
+            continue
         out.append(f"\n\nclass {td.name}(TypedDict, total=False):\n")
         if td.description:
             out.append(docstring(td.description, "    "))
@@ -323,25 +341,24 @@ def param_annotation(emitter: TypeEmitter, endpoint: Endpoint, param: Param) -> 
     return typ if typ.startswith("Optional[") else f"Optional[{typ}]"
 
 
-def render_signature(emitter: TypeEmitter, endpoint: Endpoint, extra: str = "") -> str:
+def render_signature(emitter: TypeEmitter, endpoint: Endpoint, *extra: str) -> str:
     lines = ["self", "*"]
+    lines.extend(e for e in extra if "=" not in e)
     for p in endpoint.params:
         ann = param_annotation(emitter, endpoint, p)
         lines.append(f"{p.name}: {ann}" if p.required else f"{p.name}: {ann} = None")
-    if extra:
-        lines.append(extra)
+    lines.extend(e for e in extra if "=" in e)
     lines.append("extra_body: Optional[Mapping[str, Any]] = None")
     lines.append("timeout: Optional[float] = None")
     return "".join(f"        {line},\n" for line in lines)
 
 
-def render_args_doc(endpoint: Endpoint, extra: Optional[Tuple[str, str]] = None) -> str:
+def render_args_doc(endpoint: Endpoint, *extra: Tuple[str, str]) -> str:
     rows = []
     for p in endpoint.params:
         desc = " ".join(p.description.split()) or "See the API reference."
         rows.append((p.name, desc))
-    if extra:
-        rows.append(extra)
+    rows.extend(extra)
     rows.append(("extra_body", "Additional JSON fields to send, for parameters newer than this SDK."))
     rows.append(("timeout", "Override the client timeout for this call, in seconds."))
     out = ["Args:"]
@@ -352,8 +369,9 @@ def render_args_doc(endpoint: Endpoint, extra: Optional[Tuple[str, str]] = None)
     return "\n".join(out)
 
 
-def render_body(endpoint: Endpoint) -> str:
-    items = "".join(f'            "{p.name}": {p.name},\n' for p in endpoint.params)
+def render_body(endpoint: Endpoint, extra: Tuple[str, ...] = ()) -> str:
+    names = [*extra, *(p.name for p in endpoint.params)]
+    items = "".join(f'            "{name}": {name},\n' for name in names)
     return f"        body = {{\n{items}        }}\n"
 
 
@@ -361,8 +379,11 @@ def method_doc(text: str) -> str:
     return docstring(text, "        ")
 
 
-def render_endpoint_class(emitter: TypeEmitter, endpoint: Endpoint, is_async: bool) -> str:
-    cls = ("Async" if is_async else "") + endpoint.class_name
+def render_endpoint_class(
+    emitter: TypeEmitter, endpoint: Endpoint, is_async: bool, children: Optional[Namespace] = None
+) -> str:
+    prefix = "Async" if is_async else ""
+    cls = prefix + endpoint.class_name
     base = "AsyncEndpoint" if is_async else "SyncEndpoint"
     res = f"t.{endpoint.response_expr}"
     out = [f"\n\nclass {cls}({base}):\n"]
@@ -370,6 +391,11 @@ def render_endpoint_class(emitter: TypeEmitter, endpoint: Endpoint, is_async: bo
     out.append(f'\n    _path = "{endpoint.path}"\n')
     if endpoint.pagination:
         out.append(f'    _pagination = "{endpoint.pagination}"\n')
+    if children is not None:
+        # Related endpoints nest under this one, e.g. google.images.light(...).
+        out.append(f"\n    def __init__(self, client: {prefix}BaseClient) -> None:\n")
+        out.append("        super().__init__(client)\n")
+        out.append(render_attachments(children, prefix))
     head = f"{endpoint.summary}.\n\n{endpoint.description}".strip()
 
     out.append(
@@ -379,6 +405,34 @@ def render_endpoint_class(emitter: TypeEmitter, endpoint: Endpoint, is_async: bo
     out.append(render_body(endpoint))
     call = "await self._create" if is_async else "self._create"
     out.append(f"        return {call}(body, extra_body, timeout)\n")
+
+    submit_extra = (
+        "webhook_url: str",
+        "webhook_secret: str",
+        "idempotency_key: Optional[str] = None",
+    )
+    submit_doc = (
+        f"Run {endpoint.summary} asynchronously.\n\n"
+        "Returns a job receipt once PrismCrawl accepts the request. The completed\n"
+        "response is POSTed to ``webhook_url``, signed with ``webhook_secret``; check it\n"
+        "with :func:`prismcrawl.verify_webhook`. A receipt doesn't mean the search\n"
+        "succeeded. Takes the same parameters as calling the endpoint, plus:\n\n"
+        "Args:\n"
+        "    webhook_url: Public HTTPS URL that receives the completed response by POST.\n"
+        "    webhook_secret: Shared secret (32 to 256 printable ASCII characters) used to\n"
+        "        sign deliveries.\n"
+        "    idempotency_key: Identifies this submission so retries can't start a second\n"
+        "        search. Defaults to a new UUID. Reuse it, with identical parameters, to\n"
+        "        retry an uncertain submission."
+    )
+    out.append(
+        f"\n    {'async ' if is_async else ''}def submit(\n"
+        f"{render_signature(emitter, endpoint, *submit_extra)}    ) -> AsyncReceipt:\n"
+    )
+    out.append(method_doc(submit_doc))
+    out.append(render_body(endpoint, WEBHOOK_PARAMS))
+    submit_call = "await self._submit" if is_async else "self._submit"
+    out.append(f"        return {submit_call}(body, extra_body, timeout, idempotency_key)\n")
 
     if endpoint.pagination:
         iterator = "AsyncIterator" if is_async else "Iterator"
@@ -413,21 +467,52 @@ def build_tree(endpoints: List[Endpoint]) -> Namespace:
     for ep in endpoints:
         node = root
         for seg in ep.attr_path[:-1]:
-            if seg in node.endpoints:
-                raise SystemExit(f"{seg} is both an endpoint and a namespace")
             node = node.children.setdefault(seg, Namespace(node.path + [seg]))
-        leaf = ep.attr_path[-1]
-        if leaf in node.children:
-            raise SystemExit(f"{leaf} is both an endpoint and a namespace")
-        node.endpoints[leaf] = ep
+        node.endpoints[ep.attr_path[-1]] = ep
+    check_nesting(root)
     return root
 
 
-def walk(ns: Namespace) -> List[Namespace]:
+# An endpoint's children become attributes of it, so they can't shadow its methods.
+RESERVED_CHILD_NAMES = {"get", "pages", "submit"}
+
+
+def check_nesting(ns: Namespace) -> None:
+    for name, child in ns.children.items():
+        if name in ns.endpoints:
+            for key in [*child.children, *child.endpoints]:
+                if key in RESERVED_CHILD_NAMES or key.startswith("_"):
+                    raise SystemExit(f"{'.'.join(child.path + [key])} collides with an endpoint method")
+        check_nesting(child)
+
+
+def nested_children(ns: Namespace) -> Dict[str, Namespace]:
+    """Map each endpoint path to the namespace of endpoints nested under it."""
+    out: Dict[str, Namespace] = {}
+    for name, child in ns.children.items():
+        if name in ns.endpoints:
+            out[ns.endpoints[name].path] = child
+        out.update(nested_children(child))
+    return out
+
+
+def render_attachments(ns: Namespace, prefix: str) -> str:
     out = []
-    for child in ns.children.values():
-        out.extend(walk(child))
-    out.append(ns)
+    for name, child in sorted(ns.children.items()):
+        if name not in ns.endpoints:
+            out.append(f"        self.{name} = {prefix}{child.class_name}(client)\n")
+    for name, ep in sorted(ns.endpoints.items()):
+        out.append(f"        self.{name} = {prefix}{ep.class_name}(client)\n")
+    return "".join(out)
+
+
+def walk(ns: Namespace, merged: bool = False) -> List[Namespace]:
+    """Namespaces that need their own class; ones nested under an endpoint don't."""
+    out = []
+    for name, child in ns.children.items():
+        out.extend(walk(child, merged=name in ns.endpoints))
+    if not merged:
+        out.append(ns)
     return out
 
 
@@ -443,10 +528,7 @@ def render_namespace(ns: Namespace, is_async: bool) -> str:
         label = " ".join(pascal(p) for p in ns.path)
         out.append(f'    """{label} endpoints."""\n\n')
         out.append(f"    def __init__(self, client: {prefix}BaseClient) -> None:\n")
-    for name, child in sorted(ns.children.items()):
-        out.append(f"        self.{name} = {prefix}{child.class_name}(client)\n")
-    for name, ep in sorted(ns.endpoints.items()):
-        out.append(f"        self.{name} = {prefix}{ep.class_name}(client)\n")
+    out.append(render_attachments(ns, prefix))
     if is_root:
         for alias, target in NAMESPACE_ALIASES.items():
             out.append(f"        self.{alias} = self.{target}\n")
@@ -463,17 +545,46 @@ def render_resources(endpoints: List[Endpoint], emitter: TypeEmitter) -> str:
         "from typing_extensions import Literal\n\n",
         "from . import types as t\n",
         "from ._base import AsyncBaseClient, BaseClient\n",
+        "from ._async import AsyncReceipt\n",
         "from ._endpoint import AsyncEndpoint, SyncEndpoint\n",
     ]
+    nested = nested_children(tree)
     for ep in endpoints:
-        out.append(render_endpoint_class(emitter, ep, is_async=False))
+        out.append(render_endpoint_class(emitter, ep, is_async=False, children=nested.get(ep.path)))
     for ns in walk(tree):
         out.append(render_namespace(ns, is_async=False))
     for ep in endpoints:
-        out.append(render_endpoint_class(emitter, ep, is_async=True))
+        out.append(render_endpoint_class(emitter, ep, is_async=True, children=nested.get(ep.path)))
     for ns in walk(tree):
         out.append(render_namespace(ns, is_async=True))
     return "".join(out)
+
+
+FORMATS = {"json", "md", "html+br+base64"}
+
+
+def clean_spec(node: Any) -> None:
+    """Drop the published spec's zero-default alternative from ``format`` discriminators.
+
+    The spec marks response constants as "value or zero default", which turns
+    ``data.format`` into ``"" | "json"``. The API never sends an empty format.
+    """
+    if isinstance(node, list):
+        for item in node:
+            clean_spec(item)
+        return
+    if not isinstance(node, dict):
+        return
+    fmt = (node.get("properties") or {}).get("format")
+    if isinstance(fmt, dict) and len(fmt.get("anyOf", [])) == 2:
+        kept = [a for a in fmt["anyOf"] if a.get("const") != ""]
+        if len(kept) == 1 and kept[0].get("const") in FORMATS:
+            node["properties"]["format"] = {
+                **kept[0],
+                **({"description": fmt["description"]} if "description" in fmt else {}),
+            }
+    for value in node.values():
+        clean_spec(value)
 
 
 def main() -> None:
@@ -485,6 +596,7 @@ def main() -> None:
             spec_text = resp.read().decode("utf-8")
         SPEC_PATH.write_text(json.dumps(json.loads(spec_text), indent=2) + "\n")
     spec = json.loads(SPEC_PATH.read_text())
+    clean_spec(spec)
 
     emitter = TypeEmitter(spec)
     for raw in emitter.schemas:

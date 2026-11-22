@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import inspect
 import json
 from pathlib import Path
@@ -389,6 +391,8 @@ def endpoints(namespace: Any, path: str = "client") -> Iterator[Any]:
             continue
         if isinstance(value, (SyncEndpoint, AsyncEndpoint)):
             yield f"{path}.{name}", value
+            # Related endpoints nest under their parent, e.g. google.images.light.
+            yield from endpoints(value, f"{path}.{name}")
         elif hasattr(value, "__dict__"):
             yield from endpoints(value, f"{path}.{name}")
 
@@ -424,7 +428,174 @@ def test_signatures_match_spec_required_fields() -> None:
     for _, endpoint in endpoints(client):
         op = SPEC["paths"][endpoint._path]["post"]
         schema = schemas[op["requestBody"]["content"]["application/json"]["schema"]["$ref"].rsplit("/", 1)[-1]]
+        webhook = {"webhook_url", "webhook_secret"}
         params = inspect.signature(endpoint.__call__).parameters
         required = {n for n, p in params.items() if p.default is inspect.Parameter.empty}
         assert required == set(schema.get("required", [])), endpoint._path
-        assert set(schema["properties"]) <= set(params), endpoint._path
+        assert set(schema["properties"]) - webhook <= set(params), endpoint._path
+        assert not webhook & set(params), endpoint._path
+        submit = inspect.signature(endpoint.submit).parameters
+        submit_required = {n for n, p in submit.items() if p.default is inspect.Parameter.empty}
+        assert submit_required == set(schema.get("required", [])) | webhook, endpoint._path
+        assert set(schema["properties"]) <= set(submit), endpoint._path
+
+
+# Nested endpoints, async submission, request history, and webhooks.
+
+JOB = "v3-" + "a" * 96
+HOOK_URL = "https://example.com/hook"
+HOOK_SECRET = "s" * 32
+
+
+def receipt(status: str = "queued") -> httpx.Response:
+    return httpx.Response(
+        202,
+        json={
+            "success": True,
+            "request_id": REQUEST_ID,
+            "data": {
+                "job_id": JOB,
+                "status": status,
+                "status_url": f"/v1/async/requests/{JOB}",
+                "result_url": f"/v1/async/requests/{JOB}/result",
+                "accepted_at": "2026-11-20T00:00:00Z",
+                "result_expires_at": None,
+                "result_status": None,
+                "error": None,
+                "webhook": {"status": "waiting", "attempts": 0, "response_status": 0},
+            },
+        },
+    )
+
+
+def test_nested_endpoints() -> None:
+    recorder = Recorder(ok())
+    client = make_client(recorder)
+    client.google.images(query="q")
+    assert recorder.requests[-1].url.path == "/v1/google/images"
+    client.google.images.light(query="q")
+    assert recorder.requests[-1].url.path == "/v1/google/images/light"
+    client.google.ads.transparency.details(advertiser_id="a", creative_id="c")
+    assert recorder.requests[-1].url.path == "/v1/google/ads/transparency/details"
+
+
+def test_submit_sends_prefer_and_idempotency_key() -> None:
+    recorder = Recorder(receipt())
+    result = make_client(recorder).google.search.submit(query="q", webhook_url=HOOK_URL, webhook_secret=HOOK_SECRET)
+    assert result["data"]["job_id"] == JOB
+    request = recorder.requests[-1]
+    assert request.headers["prefer"] == "respond-async"
+    assert len(request.headers["idempotency-key"]) == 36
+    assert recorder.body() == {"webhook_url": HOOK_URL, "webhook_secret": HOOK_SECRET, "query": "q"}
+
+
+def test_submit_retries_dropped_connections_with_the_same_key() -> None:
+    recorder = Recorder(httpx.ReadTimeout("slow"), receipt())
+    make_client(recorder).yelp.reviews.submit(
+        id="biz", idempotency_key="key-1", webhook_url=HOOK_URL, webhook_secret=HOOK_SECRET
+    )
+    assert [r.headers["idempotency-key"] for r in recorder.requests] == ["key-1", "key-1"]
+
+
+def test_sync_calls_do_not_accept_webhook_fields() -> None:
+    with pytest.raises(TypeError):
+        make_client(Recorder(ok())).google.search(query="q", webhook_url=HOOK_URL)  # type: ignore[call-arg]
+
+
+def test_async_jobs_status_and_result() -> None:
+    recorder = Recorder(receipt("running"), ok())
+    client = make_client(recorder)
+    assert client.async_jobs.status(JOB)["data"]["status"] == "running"
+    assert recorder.requests[-1].url.path == f"/v1/async/requests/{JOB}"
+    client.async_jobs.result(JOB)
+    assert recorder.requests[-1].url.path == f"/v1/async/requests/{JOB}/result"
+
+
+def test_async_client_submit() -> None:
+    recorder = Recorder(receipt())
+
+    async def run() -> str:
+        async with make_async_client(recorder) as client:
+            response = await client.google.images.light.submit(
+                query="q", webhook_url=HOOK_URL, webhook_secret=HOOK_SECRET
+            )
+            return response["data"]["job_id"]
+
+    assert asyncio.run(run()) == JOB
+    assert recorder.requests[-1].url.path == "/v1/google/images/light"
+
+
+def history_page(cursor: Optional[str]) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "success": True,
+            "request_id": REQUEST_ID,
+            "data": {"requests": [], "next_cursor": cursor, "range": {"from": "a", "to": "b"}},
+        },
+    )
+
+
+def test_account_requests_pages_follow_next_cursor() -> None:
+    recorder = Recorder(history_page("c2"), history_page(None))
+    pages = list(make_client(recorder).account.requests.pages(provider="google", from_="2026-11-01T00:00:00Z"))
+    assert len(pages) == 2
+    first, second = recorder.requests
+    assert first.url.path == "/v1/account/requests"
+    assert first.url.params["provider"] == "google"
+    assert first.url.params["from"] == "2026-11-01T00:00:00Z"
+    assert "cursor" not in first.url.params
+    assert second.url.params["cursor"] == "c2"
+
+
+def test_account_requests_get() -> None:
+    recorder = Recorder(ok())
+    make_client(recorder).account.requests.get(REQUEST_ID)
+    assert recorder.requests[-1].url.path == f"/v1/account/requests/{REQUEST_ID}"
+
+
+SECRET = "w" * 40
+PAYLOAD = json.dumps({"success": True, "request_id": REQUEST_ID, "data": {"format": "json", "content": {}}})
+T = 1_800_000_000
+
+
+def sign(body: str, ts: int = T, key: str = SECRET) -> str:
+    digest = hmac.new(key.encode(), f"{ts}.{body}".encode(), hashlib.sha256).hexdigest()
+    return f"t={ts},v1={digest}"
+
+
+def webhook_headers(signature: str) -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Prism-Signature": signature,
+        "Prism-Event-Id": REQUEST_ID,
+        "Prism-Request-Id": REQUEST_ID,
+        "Prism-Result-Status": "200",
+    }
+
+
+def test_verify_webhook_accepts_valid_deliveries() -> None:
+    event = prismcrawl.verify_webhook(PAYLOAD, webhook_headers(sign(PAYLOAD)), SECRET, now=T)
+    assert event.event_id == REQUEST_ID
+    assert event.request_id == REQUEST_ID
+    assert event.result_status == 200
+    assert event.body["success"] is True
+    event = prismcrawl.verify_webhook(PAYLOAD.encode(), httpx.Headers(webhook_headers(sign(PAYLOAD))), SECRET, now=T)
+    assert event.timestamp == T
+
+
+@pytest.mark.parametrize(
+    ("payload", "headers", "secret", "now", "match"),
+    [
+        (PAYLOAD + " ", None, SECRET, T, "doesn't match"),
+        (PAYLOAD, None, "x" * 40, T, "doesn't match"),
+        (PAYLOAD, None, SECRET, T + 301, "tolerance"),
+        (PAYLOAD, {"Prism-Event-Id": "e"}, SECRET, T, "Missing Prism-Signature"),
+        (PAYLOAD, webhook_headers("t=1,v1=zz"), SECRET, T, "Malformed"),
+    ],
+)
+def test_verify_webhook_rejects_bad_deliveries(
+    payload: str, headers: Optional[Dict[str, str]], secret: str, now: int, match: str
+) -> None:
+    with pytest.raises(prismcrawl.WebhookVerificationError, match=match):
+        prismcrawl.verify_webhook(payload, headers or webhook_headers(sign(PAYLOAD)), secret, now=now)

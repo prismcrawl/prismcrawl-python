@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, AsyncIterator, ClassVar, Dict, Iterator, Mapping, Optional, Union, overload
 from urllib.parse import quote
 
@@ -25,6 +26,11 @@ def _history_params(artifact: Optional[str]) -> Optional[Dict[str, str]]:
     if artifact not in ("json", "html"):
         raise ValueError('artifact must be "json", "html", or None')
     return {"artifact": artifact}
+
+
+def _submit_headers(idempotency_key: Optional[str]) -> Dict[str, str]:
+    # The key lets PrismCrawl recognize a resent submission and return the existing job.
+    return {"prefer": "respond-async", "idempotency-key": idempotency_key or str(uuid.uuid4())}
 
 
 def _next_body(kind: Optional[str], body: Dict[str, Any], page: Any) -> Optional[Dict[str, Any]]:
@@ -52,6 +58,22 @@ class SyncEndpoint:
         self, body: Mapping[str, Any], extra_body: Optional[Mapping[str, Any]], timeout: Optional[float]
     ) -> Any:
         return self._client._request("POST", self._path, json=_build_body(body, extra_body), timeout=timeout)
+
+    def _submit(
+        self,
+        body: Mapping[str, Any],
+        extra_body: Optional[Mapping[str, Any]],
+        timeout: Optional[float],
+        idempotency_key: Optional[str],
+    ) -> Any:
+        return self._client._request(
+            "POST",
+            self._path,
+            json=_build_body(body, extra_body),
+            timeout=timeout,
+            headers=_submit_headers(idempotency_key),
+            idempotent=True,
+        )
 
     def _pages(
         self,
@@ -106,6 +128,22 @@ class AsyncEndpoint:
         self, body: Mapping[str, Any], extra_body: Optional[Mapping[str, Any]], timeout: Optional[float]
     ) -> Any:
         return await self._client._request("POST", self._path, json=_build_body(body, extra_body), timeout=timeout)
+
+    async def _submit(
+        self,
+        body: Mapping[str, Any],
+        extra_body: Optional[Mapping[str, Any]],
+        timeout: Optional[float],
+        idempotency_key: Optional[str],
+    ) -> Any:
+        return await self._client._request(
+            "POST",
+            self._path,
+            json=_build_body(body, extra_body),
+            timeout=timeout,
+            headers=_submit_headers(idempotency_key),
+            idempotent=True,
+        )
 
     async def _pages(
         self,

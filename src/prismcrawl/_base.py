@@ -87,10 +87,13 @@ def _status_retry_delay(response: httpx.Response, attempt: int) -> Optional[floa
     return None
 
 
-def _transport_retry_delay(error: httpx.TransportError, method: str, attempt: int) -> Optional[float]:
+def _transport_retry_delay(
+    error: httpx.TransportError, method: str, attempt: int, idempotent: bool = False
+) -> Optional[float]:
     # A connect failure means the request was never sent. Anything later (read timeout,
-    # dropped connection) may have completed a billable search, so only GETs retry.
-    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)) or method == "GET":
+    # dropped connection) may have completed a billable search, so only GETs and
+    # idempotency-keyed submissions retry.
+    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)) or method == "GET" or idempotent:
         return _backoff(attempt)
     return None
 
@@ -143,13 +146,14 @@ class _ClientConfig:
         json: Optional[Any],
         params: Optional[Mapping[str, str]],
         timeout: Optional[float],
+        headers: Optional[Mapping[str, str]] = None,
     ) -> httpx.Request:
         return client.build_request(
             method,
             self.base_url + path,
             json=json,
             params=params,
-            headers=self.headers,
+            headers={**self.headers, **(headers or {}), "x-api-key": self.api_key},
             timeout=self.timeout if timeout is None else timeout,
         )
 
@@ -184,14 +188,16 @@ class BaseClient:
         params: Optional[Mapping[str, str]] = None,
         timeout: Optional[float] = None,
         raw_text: bool = False,
+        headers: Optional[Mapping[str, str]] = None,
+        idempotent: bool = False,
     ) -> Any:
-        request = self._config.build(self._http, method, path, json, params, timeout)
+        request = self._config.build(self._http, method, path, json, params, timeout, headers)
         attempt = 0
         while True:
             try:
                 response = self._http.send(request)
             except httpx.TransportError as error:
-                delay = _transport_retry_delay(error, method, attempt)
+                delay = _transport_retry_delay(error, method, attempt, idempotent)
                 if delay is None or attempt >= self._config.max_retries:
                     raise _wrap_transport_error(error) from error
             else:
@@ -244,14 +250,16 @@ class AsyncBaseClient:
         params: Optional[Mapping[str, str]] = None,
         timeout: Optional[float] = None,
         raw_text: bool = False,
+        headers: Optional[Mapping[str, str]] = None,
+        idempotent: bool = False,
     ) -> Any:
-        request = self._config.build(self._http, method, path, json, params, timeout)
+        request = self._config.build(self._http, method, path, json, params, timeout, headers)
         attempt = 0
         while True:
             try:
                 response = await self._http.send(request)
             except httpx.TransportError as error:
-                delay = _transport_retry_delay(error, method, attempt)
+                delay = _transport_retry_delay(error, method, attempt, idempotent)
                 if delay is None or attempt >= self._config.max_retries:
                     raise _wrap_transport_error(error) from error
             else:
